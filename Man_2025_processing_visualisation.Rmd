@@ -1,0 +1,285 @@
+---
+title: "01_Processing_QC"
+output: html_document
+date: "2025-09-17"
+---
+
+#Load libraries
+```{r}
+library(Seurat)
+library(tidyverse)
+library(CytoTRACE)
+library(destiny)
+library(slingshot)
+library(SCpubr)
+library(pheatmap)
+library(ComplexHeatmap)
+library(RColorBrewer)
+library(ggpubr)
+
+shiny_col<-c("0" = "#A6CEE3","1" = "#99CD91","2" = "#B89B74","3" = "#F06C45","4" = "#ED8F47","5" = "#825D99","6" = "#B15928")
+```
+
+#Load data
+```{r}
+laneA = Read10X("./GSE287643_WT/")
+seuA = CreateSeuratObject(laneA$`Gene Expression`, project = "WT")
+seuA[["ADT"]] = CreateAssayObject(laneA$`Antibody Capture`[1:2,])
+
+laneB = Read10X("./GSE287643_KO/")
+seuB = CreateSeuratObject(laneB$`Gene Expression`, project = "TCF1")
+seuB[["ADT"]] = CreateAssayObject(laneB$`Antibody Capture`[1:2, ])
+
+seu = merge(seuA, seuB)
+
+```
+
+#Preprocessing and filtering
+```{r}
+seu@meta.data %>% as_tibble() %>%
+  ggplot(aes(nFeature_RNA, ..density.., colour = orig.ident)) +
+  geom_density() + theme_classic() +
+  geom_vline(xintercept = 1400)
+
+seu@meta.data %>% as_tibble() %>%
+  ggplot(aes(nCount_RNA, ..density.., colour = orig.ident)) +
+  geom_density() + theme_classic() +
+  scale_x_continuous(trans = "log10") +
+  geom_vline(xintercept = 10000)
+
+seu$percent.mt = PercentageFeatureSet(seu, pattern = "^mt.")
+
+seu@meta.data %>% as_tibble() %>%
+  ggplot(aes(percent.mt, ..density.., colour = orig.ident)) +
+  geom_density() + theme_classic() +
+  geom_vline(xintercept = 5)
+
+seu_obj = seu[,seu$nCount_RNA <= 10000 &
+                 seu$nFeature_RNA >= 1400 &
+                 seu$percent.mt <= 5]
+
+seu_obj = NormalizeData(seu_obj, assay = "ADT",
+                                         normalization.method = "CLR")
+
+seu_obj = HTODemux(seu_obj, assay = "ADT")
+
+
+seu_obj = seu_obj[,seu_obj$hash.ID != "Doublet"]
+
+seu_obj$group = ifelse(seu_obj$orig.ident == "WT",
+                        case_when(seu_obj$hash.ID == "HT1" ~ "Mem_si_IEL_WT",
+                                  seu_obj$hash.ID == "HT2" ~ "Mem_si_LP_WT",
+                                  .default = "Rechallenged_si_IEL_WT"), 
+                        case_when(seu_obj$hash.ID == "HT1" ~ "Mem_si_IEL_TCF1",
+                                  seu_obj$hash.ID == "HT2" ~ "Mem_si_LP_TCF1",
+                                  .default = "Rechallenged_si_IEL_TCF1"))
+
+
+```
+
+
+#SCTransform
+```{r}
+seu_obj2<-seu_obj
+
+seu_obj2<-SCTransform(seu_obj2, vars.to.regress = c("G2M.Score"))
+
+seu_obj2<-FindVariableFeatures(seu_obj2)
+Vfeat4<-VariableFeatures(seu_obj2)
+Vfeatfilt3<-Vfeat4[!Vfeat4 %in% Ifn_genes_comb]
+Vfeatfilt3<-Vfeatfilt3[!Vfeatfilt3 %in% g2m.genes]
+Vfeatfilt3<-Vfeatfilt3[!Vfeatfilt3 %in% s.genes]
+Vfeatfilt3 = Vfeatfilt3[!grepl("^Tr[ab]", Vfeatfilt3)]
+```
+
+#Dimensional reduction
+```{r}
+seu_obj2<-RunPCA(seu_obj2, features = Vfeatfilt3)
+ElbowPlot(seu_obj2)
+seu_obj2<-RunUMAP(seu_obj2, dims = 1:10)
+seu_obj2<-FindNeighbors(seu_obj2, dims = 1:10) %>% FindClusters(resolution = c(0.1,0.2,0.3,0.4,0.5))
+clustree(seu_obj2)
+
+seu_obj2$new_res04<-factor(ifelse(seu_obj2$SCT_snn_res.0.4 == 7, 6, paste0(seu_obj2$SCT_snn_res.0.3)), levels = seq(0,6))
+```
+
+#CytoTrace
+```{r}
+cyto = CytoTRACE(as.matrix(seu_obj2@assays$RNA$counts))
+
+seu_obj2$CytoTRACE = cyto$CytoTRACE
+```
+
+#DiffusionMap
+```{r}
+diff_obj<-as.ExpressionSet(as.data.frame(t(seu_obj2@assays$SCT$scale.data)))
+
+diff_obj<-DiffusionMap(diff_obj)
+
+diff_mat<-data.matrix(diff_obj@eigenvectors)
+
+seu_obj2[["destiny"]]<-CreateDimReducObject(embeddings = diff_mat, key = "DC_", assay = "SCT")
+
+seu_obj2$DC_1<-seu_obj2@reductions$destiny@cell.embeddings[,1]
+seu_obj2$DC_2<-seu_obj2@reductions$destiny@cell.embeddings[,2]
+seu_obj2$DC_3<-seu_obj2@reductions$destiny@cell.embeddings[,3]
+
+```
+
+#slingshot
+```{r}
+
+scemerge <- as.SingleCellExperiment(seu_obj2, assay = "SCT")
+scemerge2 <- slingshot(scemerge, clusterLabels = 'new_res04', reducedDim = 'DESTINY', start.clus = "4")
+
+### on UMAP
+curves <- slingCurves(scemerge2, as.df = TRUE)
+
+```
+
+#Figure 3
+```{r}
+#Fig3b
+DimPlot(seu_obj2, group.by = "new_res04", cols = shiny_col, reduction = "umap")
+
+#Fig3D
+do_BarPlot(seu_obj2[,seu_obj2$genotype == "Wild-type"], group.by = "new_res04", split.by = "annotation2", position = "fill", colors.use = shiny_col, plot.title = "Wild-type", legend.position = "none") |
+  do_BarPlot(seu_obj2[,seu_obj2$genotype == "TCF1 KO"], group.by = "new_res04", split.by = "annotation2", position = "fill", colors.use = shiny_col, plot.title = "TCF1 KO", legend.position = "right")
+
+#Fig3E
+Idents(seu_obj2)<-"new_res04"
+features <- rownames(seu_obj2) %>% as_tibble() %>% filter(!grepl("Tr[abgd][vdjc]",value)) %>% filter(!grepl("Tcrg",value))
+
+comb_markers<-FindAllMarkers(seu_obj2, min.pct = 0.1, only.pos = TRUE, features = features$value) %>% filter(p_val_adj < 0.1 & abs(avg_log2FC) > 0.5)
+seu_obj2 <- ScaleData(seu_obj2, features = features$value)
+genes<-comb_markers %>% group_by(cluster) %>% slice_head(n=10)
+
+hm_data<-AverageExpression(seu_obj2, features = genes$gene, slot = "scale.data")[["SCT"]] %>% as.matrix()
+colnames(hm_data)<-levels(seu_obj2$new_res04)
+
+hmDE<-pheatmap(hm_data, cluster_cols = FALSE, cluster_rows = FALSE, scale = "row", angle_col = "0")
+
+#Fig3F
+DefaultAssay(seu_obj2)<-"SCT"
+seu_obj2<-PrepSCTFindMarkers(seu_obj2)
+Idents(seu_obj2)<-"genotype"
+features <- rownames(seu_obj2) %>% as_tibble() %>% filter(!grepl("Tr[abgd][vdjc]",value)) %>% filter(!grepl("Tcrg",value))
+genomark<-list()
+for (i in levels(seu_obj2$new_res04)){
+genomark[[i]]<-FindMarkers(seu_obj2[,seu_obj2$new_res04 == i],min.pct = 0.1,ident.1="TCF1 KO", group.by = "genotype", assay = "SCT") %>% rownames_to_column(var = "gene") %>% mutate(cluster2=paste0(i))
+}
+
+HMDEG<-bind_rows(genomark, .id = "cluster2") %>% arrange(cluster2, -avg_log2FC)  %>% filter(gene %in% features$value)  %>% filter(p_val_adj < 0.1 & abs(avg_log2FC) > 0.5) %>% arrange(cluster2, -avg_log2FC) 
+genesOI<-read_delim("genelist.txt", delim = "\n", col_names = FALSE)$X1
+seu_obj2$geno.clust<-paste0(seu_obj2$new_res04,"_",seu_obj2$genotype)
+seu_obj2$geno.clust<-gsub("Wild-type","WT",seu_obj2$geno.clust)
+seu_obj2$geno.clust<-gsub("TCF1 ","",seu_obj2$geno.clust)
+seu_obj2$geno.clust<-factor(seu_obj2$geno.clust)
+
+seu_obj2<-ScaleData(seu_obj2, assay = "SCT", features = unique(HMDEG$gene))
+expr<-list()
+for (i in levels(seu_obj2$new_res04)){
+expr[[i]]<-data.frame(expr=AverageExpression(seu_obj2, features = HMDEG$gene[HMDEG$cluster2 == i], assays = "SCT", group.by = "genotype", slot = "scale.data")$SCT) %>% mutate(cluster = i) %>% rownames_to_column(var = "gene")
+}
+expr_all<-bind_rows(expr, .id = "cluster")
+colnames(expr_all)<-c("gene","WT","KO","cluster")
+ha = rowAnnotation(cluster=expr_all$cluster, col = list(cluster = shiny_col))
+
+labels<-ifelse(expr_all$gene %in% genesOI, expr_all$gene, paste0(""))
+
+hb = rowAnnotation(foo = anno_mark(at = c(which(!labels == "")), 
+    labels = labels[!labels == ""], padding = 0.2))
+
+ha = rowAnnotation(foo = anno_block(gp=gpar(fill=shiny_col),labels = c("0", "1", "2","3","4","5","6"), labels_gp = gpar(col = "white", fontsize = 10), labels_rot = 0))
+hm<-Heatmap(expr_all[,2:3], cluster_rows = F, show_row_names = F, cluster_columns = F, column_names_rot = 45, name = "Expression", left_annotation = ha, row_split = factor(expr_all$cluster),row_gap = unit(3, "mm"), col = rev(brewer.pal(n = 7, name = "RdYlBu")), row_title = NULL,heatmap_width = unit(3, "in"),heatmap_height = unit(12, "in"), right_annotation = hb)
+draw(hm)
+
+#Fig3G
+VlnPlot(seu_obj2, features = c("Tcf7","Id3"), group.by = "new_res04", cols = shiny_col)
+
+
+#Fig3J
+do_DimPlot(seu_obj2[,seu_obj2$genotype == "Wild-type"], reduction = "destiny", dims = c(2,3), colors.use = shiny_col, group.by = "new_res04", plot.axes = TRUE, plot.title = "Wild-type trajectory") + geom_path(data = curves, aes(x=DC_2,y=DC_3, group = Lineage), linewidth = 1, colour = "red")  |  
+do_DimPlot(seu_obj2[,seu_obj2$genotype == "TCF1 KO"], reduction = "destiny", dims = c(2,3), colors.use = shiny_col, group.by = "new_res04", plot.axes = TRUE, plot.title = "TCF1 KO trajectory") + geom_path(data = curves, aes(x=DC_2,y=DC_3, group = Lineage), linewidth = 1, colour = "red") 
+
+#Fig3K
+combDF<-data.frame(DC1 = seu_obj2@reductions[["destiny"]]@cell.embeddings[,1], DC2 = seu_obj2@reductions[["destiny"]]@cell.embeddings[,2], DC3 = seu_obj2@reductions[["destiny"]]@cell.embeddings[,3], genotype = seu_obj2$genotype, type = seu_obj2$new_res04, anno = seu_obj2$annotation2) %>%
+  mutate(cell = rownames(.))
+names(shiny_col)
+combDF %>%
+  ggplot(mapping = aes(x=DC2, y = genotype, fill = type))  +
+  geom_point(aes(fill = factor(type)),stat = "identity", position = "jitter", size = 4, shape = 21) +
+  scale_fill_manual(values = shiny_col) +
+    theme_minimal() +
+    ylab(element_blank()) +
+    xlab("Diffusion Component 2") +
+    guides(fill=guide_legend(title="Cluster")) +
+    scale_y_discrete(labels = c("WT" = "Wild-type", "TCF1 KO" = "KO"))  +
+    theme(axis.line = element_line(color = "black"), panel.grid.major = element_blank(),panel.grid.minor = element_blank())
+```
+
+#Figure 4
+Data from Milner et. al. (2020) Heterogenous Populations of Tissue-Resident CD8+ T Cells Are Generated in Response to Infection and Malignancy. Immunity
+```{r}
+DimPlot(seu_milner[,seu_milner$tissue == "Gut"], group.by = "timepoint", label = T, label.box = T)
+
+FeaturePlot(seu_milner[,seu_milner$tissue == "Gut"], features = c("Id3","Tcf7"),blend = TRUE, slot = "scale.data", pt.size = 1, order = T, blend.threshold = 0)
+```
+
+#Supplementary Figure 5
+```{r}
+#FigS5A
+VlnPlot(seu_obj2, features = "CytoTRACE", group.by = "new_res04", cols = shiny_col)
+
+#FigS5D
+point_data<-data.frame(Ferreira_Tcm = seu_obj2$Ferreira_Tcm, Ferreira_Tem = seu_obj2$Ferreira_Tem, Exhausted_Precursor_TPEX = seu_obj2$Exhausted_Precursor_TPEX, Exhausted_Effector_TEX = seu_obj2$Exhausted_Effector_TEX, genotype = factor(seu_obj2$genotype)) %>% pivot_longer(-genotype,values_to = "value")
+point_data %>%
+  ggplot() +
+  aes(x=genotype,y=value, fill = genotype) +
+  geom_violin() +
+  geom_point(stat = "identity", position = "jitter", size = 0.2, alpha = 0.2) +
+  stat_compare_means(comparisons = list(c("Wild-type", "TCF1 KO")), label = "p.signif") +
+  geom_boxplot(width = 0.1, fill = "white") +
+  facet_wrap(~name,scales = "free") +
+  theme_minimal() +
+  xlab(label = "Genotype") +
+  ylab("Enrichment Score")
+
+#FigS5E
+VlnPlot(seu_obj2, features = "CytoTRACE", group.by = "group", cols = shiny_col, split.by = "genotype")
+
+#FigS5F
+combDF %>%
+  ggplot(mapping = aes(x=DC1, y = genotype, fill = type))  +
+  geom_point(aes(fill = factor(type)),stat = "identity", position = "jitter", size = 4, shape = 21) +
+  scale_fill_manual(values = shiny_col) +
+    theme_minimal() +
+    ylab(element_blank()) +
+    xlab("Diffusion Component 1") +
+    guides(fill=guide_legend(title="Cluster")) +
+    scale_y_discrete(labels = c("WT" = "Wild-type", "TCF1 KO" = "KO"))  +
+    theme(axis.line = element_line(color = "black"), panel.grid.major = element_blank(),panel.grid.minor = element_blank())
+
+#FigS5G
+combDF %>%
+  ggplot(mapping = aes(x=DC3, y = genotype, fill = type))  +
+  geom_point(aes(fill = factor(type)),stat = "identity", position = "jitter", size = 4, shape = 21) +
+  scale_fill_manual(values = shiny_col) +
+    theme_minimal() +
+    ylab(element_blank()) +
+    xlab("Diffusion Component 3") +
+    guides(fill=guide_legend(title="Cluster")) +
+    scale_y_discrete(labels = c("WT" = "Wild-type", "TCF1 KO" = "KO"))  +
+    theme(axis.line = element_line(color = "black"), panel.grid.major = element_blank(),panel.grid.minor = element_blank())
+```
+
+#Supplementary Figure 6
+```{r}
+seu_milner$timepoint<-factor(seu_milner$timepoint, levels = c("Naive","D3","D4","D4_TRM","D5","D6","D7","D7_TRM","D10","D10_TRM","D14","D14_TRM" ,"D21","D21_TRM" ,"D32","D32_TRM", "D60","D60_TRM", "D90","D90_TRM"))
+
+VlnPlot(seu_milner[,seu_milner$tissue == "Spleen"], features = "Id3", group.by = "timepoint") + ylab("Expression Spleen") | VlnPlot(seu_milner[,seu_milner$tissue == "Gut"], features = "Id3", group.by = "timepoint") + ylab("Expression IEL")
+
+VlnPlot(seu_milner[,seu_milner$tissue == "Spleen"], features = "Tcf7", group.by = "timepoint", layer = "data") + ylab("Expression Spleen") | VlnPlot(seu_milner[,seu_milner$tissue == "Gut"], features = "Tcf7", group.by = "timepoint") + ylab("Expression IEL")
+  
+```
+
